@@ -1,0 +1,67 @@
+#!/bin/bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+. bin/exportable_secrets.sh
+
+aws_region='us-west-2'
+
+echo Exporting secrets...
+case "$MIX_ENV" in
+  staging)
+    environment_path="/staging/env"
+    ;;
+  prod)
+    environment_path="/production/env"
+    ;;
+  *)
+esac
+
+echo "Environment parameter prefix : $environment_path"
+
+# Fetch the secrets from AWS
+set +e
+environment=$(
+  exportable_secrets "$environment_path" "$aws_region" \
+    | sed "s/^/export / "
+)
+found_secrets=$?
+set -e
+
+# Format the names of the secrets so they can be rendered in the logfile,
+# and export the secrets into the current environment so the server can see them.
+if [[ "$found_secrets" -eq 0 ]]; then
+  var_count=$(echo "$environment" | wc -l)
+  echo "Exporting $var_count environment variables:"
+  echo "$environment" | tr '=' ' ' | awk '{ print $2 }'
+  eval ${environment}
+else
+  echo "Unable to export environment variables"
+fi
+
+
+#
+# The exec lines below cause the populated environment from above to be
+# inherited with the process_id when the server is started or a command
+# is executed.
+#
+# see: `exec` on https://www.gnu.org/software/bash/manual/html_node/Bourne-Shell-Builtins.html
+#
+
+# if a command was passed to this script, run it in the environment
+if [[ $# -gt 0 ]]; then
+  echo "Running command $@"
+  exec bash -c "$@"
+fi
+
+echo Running migrations...
+# mix ecto.migrate
+# rake db.migrate
+# etc
+
+echo Starting server...
+# exec mix phx.server
+# bin/rails serve -b 0.0.0.0
+# etc
+

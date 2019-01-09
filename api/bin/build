@@ -1,0 +1,20 @@
+#!/bin/bash
+
+set -euo pipefail
+
+env=${1:-}
+
+build_stats () {
+  echo -n "Built at: "
+  date "+%Y-%m-%d %H:%M:%S"
+  git rev-parse HEAD
+}
+
+function cleanup {
+  rm BUILD_DETAILS
+}
+trap cleanup EXIT
+build_stats > BUILD_DETAILS
+
+echo "docker build . -f Dockerfile -t hipster_startup/api"
+docker build . -f Dockerfile -t hipster_startup/api

@@ -1,0 +1,6 @@
+#!/bin/bash
+
+set -euo pipefail
+
+docker container exec -ti $(docker-compose ps -q db) psql -U postgres api_dev
+
