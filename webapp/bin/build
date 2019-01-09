@@ -1,0 +1,53 @@
+#!/bin/bash
+set -euo pipefail
+
+env=${1:-}
+
+case "$env" in
+  staging|production|integration) ;;
+  *)
+    echo "Environment must one of staging, production, integration"
+    exit 1
+esac
+
+build_args () {
+  case $env in
+    integration)
+      echo -n "--build-arg REACT_APP_API_URL=//ci.internal.hipster_startup.com/api/v1"
+      ;;
+    staging)
+      echo -n "--build-arg REACT_APP_API_URL=//staging.internal.hipster_startup.com/api/v1"
+      ;;
+    production)
+      echo -n "--build-arg REACT_APP_API_URL=//www.hipster_startup.com/api/v1"
+      ;;
+    *)
+  esac
+}
+
+build_stats () {
+  echo -n "Built at: "
+  date "+%Y-%m-%d %H:%M:%S"
+  git rev-parse HEAD
+}
+
+# Make sure the BUILD_DETAILS file gets cleaned up to keep the branch clean
+function cleanup {
+  rm BUILD_DETAILS
+}
+trap cleanup EXIT
+
+# Populate the build details.
+# This creates a file at the root of the build which contains:
+# - The git revision
+# - The timestamp of the build
+# Rendering this file to a static endpoint is _very_ helpful for:
+# - an load balancing /ping endpoint, depending on the application
+# - quickly determining what code is running on a box
+# - sanity checking that a deployment has finished
+build_stats > BUILD_DETAILS
+
+# actally run the docker build, and tag it appropriately
+echo docker build . -f docker/production.dockerfile $(build_args) -t hipster_startup/web
+docker build . -f docker/production.dockerfile $(build_args) -t hipster_startup/web
+
