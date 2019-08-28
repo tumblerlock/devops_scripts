@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# source https://github.com/tumblerlock/devops_scripts
+# version: 0.1.0
+
+# This script is used to download an entire log stream from aws cloudwatch logs.
+# Be careful with it, because cloudwatch log streams can be quite large.
+
+set -euo pipefail
+
+print_help () {
+  error_message=${1:-}
+  if [[ "$error_message" ]]; then
+    echo "Error: $error_message"
+    echo
+  fi
+
+  cat <<HELP
+Usage: $0 [options] -g <log group name> -s <log stream name>
+Example: $0 -g my_log_group -s i-02bb4fb7cd20879f5
+
+Options:
+
+-g		Log Group.
+-h		Print help.
+-r		Aws Region (default: us-east-1)
+-s		Stream name.
+
+HELP
+  exit 1
+}
+
+request_logs () {
+  token=${1:-beginning}
+
+  if [[ "$token" = "beginning" ]]; then
+    starting_position="--start-from-head"
+  else
+    starting_position="--next-token $token"
+  fi
+
+  aws logs get-log-events \
+    --region "$aws_region" \
+    $starting_position \
+    --log-group-name "$log_group" \
+    --log-stream-name "$stream"
+}
+
+aws_region="us-east-1"
+
+while getopts "g:hs:r:" opt; do
+  case $opt in
+    g) log_group="$OPTARG" ;;
+    h) print_help ;;
+    r) aws_region="$OPTARG" ;;
+    s) stream="$OPTARG" ;;
+  esac
+done
+
+[ -z ${log_group+x} ] && print_help "log group must be specified."
+[ -z ${stream+x} ] && print_help "log stream name must be specified."
+
+api_response=$(request_logs)
+
+while true ; do
+  next_token=$(echo "$api_response" | jq -r '.nextForwardToken')
+  messages=$(echo "$api_response" | jq -r '.events[] .message')
+  event_count=$(echo "$api_response" | jq -r '.events | length')
+
+
+  echo "$messages"
+  api_response=$(request_logs "$next_token")
+  new_next_token=$(echo "$api_response" | jq -r '.nextForwardToken')
+  if [[ "$new_next_token" = "$next_token" ]]; then
+    break
+  fi
+done
