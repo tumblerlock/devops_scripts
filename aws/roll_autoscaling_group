@@ -1,0 +1,170 @@
+#!/bin/bash
+
+# source https://github.com/tumblerlock/devops_scripts
+# version 0.1.0
+
+# This script is used to replace all instances in an autoscaling group.
+
+set -euo pipefail
+
+. lib/spinner.sh
+
+usage () {
+  error_message=${1:-}
+  if [[ "$error_message" ]]; then
+    echo "Error: $error_message"
+    echo
+  fi
+
+  cat <<HELP
+$0: Cycles the instances in an autoscaling group.
+
+Cycling the instances in an autoscaling group is a 4 step process:
+ - Increase the desired capacity to 2x the current running capacity. Increase max as needed.
+ - Wait for new instances to become available.
+ - Manually remove old instances.
+ - Decrease the desired capacity back to the previous value.
+
+Usage: $0 [options] <asg name>
+
+Options:
+  -d n    Set the desired capacity to n instead of reading the current desired capacity from the scaling group.
+  -D n    Set the deployment capicity to n instead of calculating it based off of the desired capacity.
+  -h      Print this help and exit.
+  -m n    Set the maximum capacity to n instead of relying on the current max capacity from the scaling group. Deployment capacity will be adjusted as needed.
+
+HELP
+
+exit 1
+}
+
+describe_asg () {
+  aws --region=us-east-1 autoscaling \
+    describe-auto-scaling-groups --auto-scaling-group-names "${1:-}"
+}
+
+update_asg_parameters () {
+  local asg="${1:-}"
+  local desired="${2:-}"
+  local max="${3:-}"
+
+  echo "Setting $asg capacity to be desired=$desired, max=$max."
+
+  aws --region=us-east-1 \
+    autoscaling update-auto-scaling-group --auto-scaling-group-name "$asg" \
+    --desired-capacity "$desired" \
+    --max-size "$max"
+}
+
+spin_for_instance_count () {
+  local asg="${1:-}"
+  local desired_count=${2:-3}
+  local message=${3:-Waiting for new instances to spin up...}
+
+  while true ; do
+    local instance_count=$(
+      describe_asg "$asg" \
+        | jq --exit-status --raw-output '
+            .AutoScalingGroups[].Instances | map(select(.LifecycleState == "InService")) | length
+        '
+    )
+
+    for i in {1..21}; do
+      spinner "[$instance_count/$desired_count] $message"
+      sleep 0.05
+    done
+
+    if [[ "$instance_count" -eq "$desired_count" ]]; then
+      spinner_cleanup
+      echo "$message SUCCESS"
+      break
+    fi
+  done
+}
+
+detach_and_terminate_instance () {
+  local asg="${1:-}"
+  local instance_id="${2:-}"
+
+  instance_attached=$(
+    aws --region=us-east-1 \
+      autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names "$asg" \
+    | jq --raw-output --exit-status '
+      .AutoScalingGroups[].Instances 
+      | map(select(.InstanceId == "'"$instance_id"'"))
+      | length == 1
+    '
+  )
+
+  if [[ "$instance_attached" = "true" ]]; then
+    aws --region=us-east-1 autoscaling \
+      detach-instances \
+        --auto-scaling-group-name="$asg" \
+        --instance-ids="$instance_id" \
+        --should-decrement-desired-capacity \
+    > /dev/null
+  fi
+
+  aws --region=us-east-1 ec2 \
+    terminate-instances --instance-ids="$instance_id" \
+  > /dev/null
+}
+
+desired_capacity="read"
+deployment_capacity="double"
+max_capacity="read"
+deployment_max_capacity="double"
+
+while getopts "d:D:hm:" opt; do
+  case $opt in
+    d) desired_capacity="$OPTARG" ;;
+    D) deployment_capacity="$OPTARG" ;;
+    h) usage ;;
+    m) max_capacity="$OPTARG" ;;
+  esac
+done
+
+asg_name=${@:$OPTIND:1}
+
+[[ ! "$asg_name" ]] && usage "Autoscaling group name is required."
+
+asg_info=$(describe_asg "$asg_name")
+old_instances=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].Instances[].InstanceId')
+
+if [[ "$desired_capacity" = "read" ]]; then
+  desired_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].DesiredCapacity')
+fi
+
+if [[ "$deployment_capacity" = "double" ]]; then
+  deployment_capacity=$(($desired_capacity * 2))
+fi
+
+if [[ "$max_capacity" = "read" ]]; then
+  max_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].MaxSize')
+fi
+
+deployment_max_capacity="$max_capacity"
+if [[ "$deployment_capacity" -gt "$deployment_max_capacity" ]]; then
+  deployment_max_capacity="$deployment_capacity"
+fi
+
+
+
+update_asg_parameters "$asg_name" "$deployment_capacity" "$deployment_max_capacity"
+spin_for_instance_count "$asg_name" "$deployment_capacity" "Waiting for instances to scale up..."
+
+echo
+echo "Decomissioning old instances..."
+
+# don't let failure to detach or terminate of a single instance kill the script
+set +e
+
+while read -r instance_id; do
+  echo " - $instance_id"
+  detach_and_terminate_instance "$asg_name" "$instance_id"
+done <<< "$old_instances"
+set -e
+
+update_asg_parameters "$asg_name" "$desired_capacity" "$max_capacity"
+spin_for_instance_count "$asg_name" "$desired_capacity" "Waiting for any remaining instances to scale down..."
