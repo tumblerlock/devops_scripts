@@ -1,4 +1,10 @@
 #!/bin/bash
+
+# source: https://github.com/tumblerlock/devops_scripts
+# version: v0.1.0
+#
+# Helper script to parse and calculate release tags on a git repo.
+
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -77,10 +83,10 @@ fi
 current_version=$(
   git tag -l \
     | grep release \
-    | sort \
-    | tail -n 1 \
     | tr '-' ' ' \
     | awk '{ print $2 }' \
+    | sort -V \
+    | tail -n 1 \
     | tr '.' ' '
 )
 
@@ -129,4 +135,4 @@ fi
 git tag "$git_tag"
 
 echo "Created $git_tag."
-echo "Run git push $git_tag to push this tag up to github for CI and deployment."
+echo "Run git push origin $git_tag to push this tag up to github for CI and deployment."
