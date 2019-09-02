@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # source: https://github.com/tumblerlock/devops_scripts
-# version: v0.1.0
+# version: v0.1.1
 #
 # Helper script to parse and calculate release tags on a git repo.
 
 set -euo pipefail
 IFS=$'\n\t'
+
+reset='\033[0m'
+green='\033[00;32m'
 
 print_help () {
   cat <<HELP
@@ -67,15 +70,12 @@ if [[ "$new_version" = false ]]; then
 fi
 
 
-
 # Pull tags from remote
 
 if [[ "$sync_tags" = true ]]; then
   echo fetching tags from remote...
   git fetch --tags
-  echo
 fi
-
 
 
 # Calculate the new release tag
@@ -124,15 +124,19 @@ else
   git_tag="release-$new_version"
 fi
 
-# Creat new release tag
+
+# Create new release tag
 
 if [[ "$dry_run" = true ]]; then
   echo "New tag would be $git_tag"
   echo Dry Run. Exiting.
-  exit
+else
+  git tag "$git_tag"
+  echo "Created $git_tag."
 fi
 
-git tag "$git_tag"
 
-echo "Created $git_tag."
-echo "Run git push origin $git_tag to push this tag up to github for CI and deployment."
+echo
+echo "Run this command to push this tag up to github for CI and deployment:"
+echo -e " ${green}git push origin ${git_tag}${reset}"
+echo
