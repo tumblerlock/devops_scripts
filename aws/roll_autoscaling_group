@@ -1,13 +1,17 @@
 #!/bin/bash
 
-# source https://github.com/tumblerlock/devops_scripts
-# version 0.1.0
+# Updated 2020-06-16
 
-# This script is used to replace all instances in an autoscaling group.
+# This script does a lot of array manipulation. SC2207 is used to advise against unsafe array manipulation
+# when the arrays could contain splitable words. The arrays in here are lists of unsplittable instance ids.
+# eg i-0a1abafe2b136d8d2
+# shellcheck disable=SC2207
 
-set -euo pipefail
+set -Eeuo pipefail
 
-. lib/spinner.sh
+. scripts/lib/spinner.sh
+
+SECONDS=0
 
 usage () {
   error_message=${1:-}
@@ -22,7 +26,6 @@ $0: Cycles the instances in an autoscaling group.
 Cycling the instances in an autoscaling group is a 4 step process:
  - Increase the desired capacity to 2x the current running capacity. Increase max as needed.
  - Wait for new instances to become available.
- - Manually remove old instances.
  - Decrease the desired capacity back to the previous value.
 
 Usage: $0 [options] <asg name>
@@ -38,6 +41,14 @@ HELP
 exit 1
 }
 
+ts () {
+  echo "$(($SECONDS / 60))m $(($SECONDS % 60))s"
+}
+
+ts_echo () {
+  echo "($(ts)) " "$@"
+}
+
 describe_asg () {
   aws --region=us-east-1 autoscaling \
     describe-auto-scaling-groups --auto-scaling-group-names "${1:-}"
@@ -48,7 +59,7 @@ update_asg_parameters () {
   local desired="${2:-}"
   local max="${3:-}"
 
-  echo "Setting $asg capacity to be desired=$desired, max=$max."
+  ts_echo "Setting $asg capacity to be desired=$desired, max=$max."
 
   aws --region=us-east-1 \
     autoscaling update-auto-scaling-group --auto-scaling-group-name "$asg" \
@@ -60,44 +71,73 @@ spin_for_instance_count () {
   local asg="${1:-}"
   local desired_count=${2:-3}
   local message=${3:-Waiting for new instances to spin up...}
+  local instance_count
 
   while true ; do
-    local instance_count=$(
+    instance_count=$(
       describe_asg "$asg" \
         | jq --exit-status --raw-output '
             .AutoScalingGroups[].Instances | map(select(.LifecycleState == "InService")) | length
         '
     )
 
-    for i in {1..21}; do
-      spinner "[$instance_count/$desired_count] $message"
+    for _ in {1..21}; do
+      spinner "[$instance_count/$desired_count $(ts)] $message"
       sleep 0.05
     done
 
     if [[ "$instance_count" -eq "$desired_count" ]]; then
       spinner_cleanup
-      echo "$message SUCCESS"
+      ts_echo "$message SUCCESS"
       break
     fi
   done
 }
 
-detach_and_terminate_instance () {
+wait_for_healthy_instance() {
+  local target_group=${1:-invalid}
+  local instance_id=${2:-invalid}
+
+  [ "$instance_id" = "invalid" ] && return;
+
+  while true ; do
+    instance_state=$(
+      aws --region=us-east-1 \
+        elbv2 describe-target-health \
+          --target-group-arn "$target_group" \
+          --targets "Id=$instance_id" \
+          --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+          --output=text
+    )
+
+    for _ in {1..21}; do
+      spinner "[$instance_state $(ts)] waiting for $instance_id to become healthy..."
+      sleep 0.05
+    done
+
+    if [[ "$instance_state" = "healthy" ]]; then
+      spinner_cleanup
+      ts_echo "$instance_id is healthy"
+      break
+    fi
+  done
+}
+
+detach_instance () {
   local asg="${1:-}"
   local instance_id="${2:-}"
 
-  instance_attached=$(
+  ts_echo "Detaching $instance_id..."
+
+  attached_instances=$(
     aws --region=us-east-1 \
       autoscaling describe-auto-scaling-groups \
         --auto-scaling-group-names "$asg" \
-    | jq --raw-output --exit-status '
-      .AutoScalingGroups[].Instances 
-      | map(select(.InstanceId == "'"$instance_id"'"))
-      | length == 1
-    '
+        --query 'AutoScalingGroups[0].Instances[*].[InstanceId]' \
+        --output=text
   )
 
-  if [[ "$instance_attached" = "true" ]]; then
+  if [[ "$attached_instances" == *$instance_id* ]]; then
     aws --region=us-east-1 autoscaling \
       detach-instances \
         --auto-scaling-group-name="$asg" \
@@ -105,6 +145,35 @@ detach_and_terminate_instance () {
         --should-decrement-desired-capacity \
     > /dev/null
   fi
+}
+
+wait_for_detachment_and_terminate_instance () {
+  local instance_id;
+  local asg;
+
+  asg=${1:-invalid}
+  instance_id=${2:-invalid}
+
+  while true ; do
+    for _ in {1..21}; do
+      spinner "[$(ts)] Waiting for $instance_id to detach..."
+      sleep 0.05
+    done
+
+    attached_instances=$(
+      aws --region=us-east-1 \
+        autoscaling describe-auto-scaling-groups \
+          --auto-scaling-group-names "$asg" \
+          --query 'AutoScalingGroups[0].Instances[*].[InstanceId]' \
+          --output=text
+    )
+
+    if [[ "$attached_instances" != *$instance_id* ]]; then
+      spinner_cleanup
+      ts_echo "$instance_id detached"
+      break
+    fi
+  done
 
   aws --region=us-east-1 ec2 \
     terminate-instances --instance-ids="$instance_id" \
@@ -115,6 +184,8 @@ desired_capacity="read"
 deployment_capacity="double"
 max_capacity="read"
 deployment_max_capacity="double"
+downscale_first=false
+downscale_to=0
 
 while getopts "d:D:hm:" opt; do
   case $opt in
@@ -122,49 +193,75 @@ while getopts "d:D:hm:" opt; do
     D) deployment_capacity="$OPTARG" ;;
     h) usage ;;
     m) max_capacity="$OPTARG" ;;
+    *) usage "unexpected option" ;;
   esac
 done
 
-asg_name=${@:$OPTIND:1}
+asg_name=${*:$OPTIND:1}
 
 [[ ! "$asg_name" ]] && usage "Autoscaling group name is required."
 
 asg_info=$(describe_asg "$asg_name")
-old_instances=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].Instances[].InstanceId')
+old_instances=($(
+  echo "$asg_info" \
+    | jq --raw-output --exit-status '
+        .AutoScalingGroups[].Instances[]
+        | select(.LifecycleState == "InService")
+        | .InstanceId
+      '
+))
 
-if [[ "$desired_capacity" = "read" ]]; then
-  desired_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].DesiredCapacity')
+current_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[0].DesiredCapacity')
+
+if [ "$current_capacity" -gt 10 ] ; then
+  downscale_first=true
+  downscale_to=10
 fi
 
-if [[ "$deployment_capacity" = "double" ]]; then
-  deployment_capacity=$(($desired_capacity * 2))
+[ "$desired_capacity" = "read" ] && desired_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].DesiredCapacity')
+if [ "$deployment_capacity" = "double" ] ; then
+  deployment_capacity=$(( $current_capacity > $desired_capacity ? $current_capacity * 2 : $desired_capacity * 2))
 fi
 
-if [[ "$max_capacity" = "read" ]]; then
-  max_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].MaxSize')
-fi
-
+[ "$max_capacity" = "read" ] && max_capacity=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[].MaxSize')
 deployment_max_capacity="$max_capacity"
-if [[ "$deployment_capacity" -gt "$deployment_max_capacity" ]]; then
-  deployment_max_capacity="$deployment_capacity"
+[ "$deployment_capacity" -gt "$deployment_max_capacity" ] && deployment_max_capacity="$deployment_capacity"
+
+[ "$deployment_capacity" -le "$desired_capacity" ] && usage "Deployment capacity must be bigger than desired capacity (deployment: $deployment_capacity; desired: $desired_capacity)."
+[ "$deployment_capacity" -le "$current_capacity" ] && usage "Deployment capacity must be bigger than current capacity (deployment: $deployment_capacity; current: $current_capacity)."
+
+if [ "$downscale_first" = true ] ; then
+  update_asg_parameters "$asg_name" "$downscale_to" 20
+  spin_for_instance_count "$asg_name" "$downscale_to" "Waiting for fleet to downsize for deployment..."
 fi
 
-
+target_group=$(echo "$asg_info" | jq --raw-output --exit-status '.AutoScalingGroups[0].TargetGroupARNs[]' )
 
 update_asg_parameters "$asg_name" "$deployment_capacity" "$deployment_max_capacity"
 spin_for_instance_count "$asg_name" "$deployment_capacity" "Waiting for instances to scale up..."
 
-echo
-echo "Decomissioning old instances..."
+new_instances=($(describe_asg "$asg_name" | jq --raw-output '.AutoScalingGroups[0].Instances[].InstanceId' ))
+for i in "${old_instances[@]}"; do
+   new_instances=("${new_instances[@]//*$i*}")
+done
+
+ts_echo "New instances added to group: ${new_instances[*]}"
+
+for instance_id in "${new_instances[@]}" ; do
+  wait_for_healthy_instance "$target_group" "$instance_id"
+done
 
 # don't let failure to detach or terminate of a single instance kill the script
 set +e
+for instance_id in "${old_instances[@]}" ; do
+  detach_instance "$asg_name" "$instance_id"
+done
 
-while read -r instance_id; do
-  echo " - $instance_id"
-  detach_and_terminate_instance "$asg_name" "$instance_id"
-done <<< "$old_instances"
+for instance_id in "${old_instances[@]}" ; do
+  wait_for_detachment_and_terminate_instance "$asg_name" "$instance_id"
+done
 set -e
+
 
 update_asg_parameters "$asg_name" "$desired_capacity" "$max_capacity"
 spin_for_instance_count "$asg_name" "$desired_capacity" "Waiting for any remaining instances to scale down..."
