@@ -117,9 +117,9 @@ if [[ "$new_version" = false ]]; then
 fi
 
 if [[ "$pre_release" = true ]]; then
-  git_tag="pre-$new_version"
+  git_tag="v$new_version-pre"
 else
-  git_tag="release-$new_version"
+  git_tag="v$new_version"
 fi
 
 
