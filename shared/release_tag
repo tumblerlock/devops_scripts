@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # source: https://github.com/tumblerlock/devops_scripts
 # version: v0.1.2
@@ -12,12 +12,18 @@ reset='\033[0m'
 green='\033[00;32m'
 
 print_help () {
+  error_message=${1:-}
+  if [[ "$error_message" ]]; then
+    echo -e "\033[31mError\033[0m: $error_message"
+    echo
+  fi
+
   cat <<HELP
 $0: increments the release version most recently tagged in git.
 
-Git release tags are of the form 'release-x.y.z'.
+Git release tags are of the form 'vX.Y.Z'.
 
-Usage: $0 -h -d -s -F -p (major|minor|patch|-v x.y.z)
+Usage: $0 -h -d -s -F -p (major|minor|patch|-v X.Y.Z)
 
   -d               Dry run.     Do not actually create any tag, only document what the next tag would be.
   -h               Help.        Print this help and exit.
@@ -25,9 +31,9 @@ Usage: $0 -h -d -s -F -p (major|minor|patch|-v x.y.z)
   -p               Pre Release. Create a pre-[version] tag to mark a commit for future release.
   -v               Version.     Create tag with manually specified version.
 
-  major            Increment the major portion of the release, expressed as 'x' above.
-  minor            Increment the minor portion of the release, expressed as 'y' above.
-  patch            Increment the patch portion of the release, expressed as 'z' above.
+  major            Increment the major portion of the release, expressed as 'X' above.
+  minor            Increment the minor portion of the release, expressed as 'Y' above.
+  patch            Increment the patch portion of the release, expressed as 'Z' above.
 
   One of major, minor, patch, or -v must be specified.
 
@@ -48,11 +54,12 @@ while getopts "dhspv:" opt; do
     s) sync_tags=false ;;
     p) pre_release=true ;;
     v) new_version="$OPTARG" ;;
+    *) print_help "Unknown option: $opt" ;;
   esac
 done
 
 if [[ "$new_version" = false ]]; then
-  shift $(($OPTIND - 1))
+  shift $((OPTIND - 1))
   release_edition=${1:-bad}
 
   if [[ "$release_edition" = "bad" ]]; then
